@@ -1,0 +1,9 @@
+# Ignore sensitive financial data
+*.csv
+*.xlsx
+/data_in/
+/outputs/
+
+# Ignore secrets
+.env
+api_key.txt
