@@ -1,0 +1,13 @@
+Rule_Name,Trigger_Type,Trigger_Value,Action,Entity_Filter,Debit_Account,Credit_Account,Memo_Tag
+Trash_ENTITY_B,AMOUNT_EQUALS,-360,STANDARD,724 3
+DG_Trash_ENTITY_C,AMOUNT_EQUALS,-140,STANDARD,ENTITY_C,Repairs and Maintenance,Cash - BB&T,Auto-Trash
+Loan_Pmt_ENTITY_B,AMOUNT_EQUALS,-3000,ZERO_OUT,ENTITY_B,Cash - BB&T,Cash - BB&T,Loan Pmt Zero Out
+Loan_Pmt_ENTITY_C1,AMOUNT_EQUALS,-1200,ZERO_OUT,ENTITY_C,Cash - BB&T,Cash - BB&T,Loan Pmt Zero Out
+Loan_Pmt_ENTITY_C2,AMOUNT_EQUALS,-5000,ZERO_OUT,ENTITY_C,Cash - BB&T,Cash - BB&T,Loan Pmt Zero Out
+CashApp_Revenue,KEYWORD,CASH APP,FORCE_CREDIT,ALL,Cash - BB&T,Rental Revenue,Auto-Rental
+Schwab_Zero,KEYWORD,MONEYLINK SCHWAB,ZERO_OUT,ALL,Cash - BB&T,Cash - BB&T,Schwab Zero Out
+CC_Pay_VisaSide,KEYWORD,THANK YOU,ZERO_OUT,VISA_ONLY,Cash - BB&T,Cash - BB&T,CC Zero Out (Visa Side)
+Generic_CC_Pay,KEYWORD,CREDIT CARD PAYMENT,CC_PAYMENT,ENTITY_A,Credit - BB&T,Cash - BB&T,CC Pmt (Generic)
+AMAZON_CC_Pay,KEYWORD,AMZ_STORECRD_PMT,ZERO_OUT,ENTITY_A,Cash - BB&T,Cash - BB&T,Amazon Zero Out
+Auto_Intercompany_Link,SYSTEM_TOGGLE,ON,INTERCOMPANY_AUTO,ALL,Cash - BB&T,Cash - BB&T,Auto-Detect Intercompany
+Partner_Distro_Split,SYSTEM_TOGGLE,ON,SPLIT_DISTRIBUTION,ENTITY_A,Partner's Capital,Short Term Notes,Auto-Split Distro
