@@ -1,5 +1,11 @@
-# Ignore sensitive financial data
+# Environment & Tools
+google-cloud-sdk/
+*.tar.gz
+repomix-output.md
+__pycache__/
+.venv/
+.DS_Store
 
-# Ignore secrets
+# Secrets
 .env
 api_key.txt
