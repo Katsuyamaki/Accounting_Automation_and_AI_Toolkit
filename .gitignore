@@ -9,3 +9,10 @@ __pycache__/
 # Secrets
 .env
 api_key.txt
+
+#AI_Tools
+CLAUDE.md
+pybuilder.py
+plan.md
+planhistory.md
+

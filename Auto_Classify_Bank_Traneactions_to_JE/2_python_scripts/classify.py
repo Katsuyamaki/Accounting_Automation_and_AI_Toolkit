@@ -1,62 +1,77 @@
 
-import pandas as pd
 import os
-import time
+import io
 import json
 import re
 import random
+import pandas as pd
+from fastapi import FastAPI, UploadFile, File, Header, HTTPException, Depends
+from google.cloud import secretmanager, storage
 from google import genai
 
 # --- CONFIGURATION ---
-INPUT_FILE = '../1_import_raw_transactions/Data_in.csv'
-RULES_FILE = '../1_import_raw_transactions/transaction_rules.csv'
-LOGIC_FILE = '../1_import_raw_transactions/logic_rules.csv'
-HISTORY_FILE = '../1_import_raw_transactions/correction_history.csv' # <--- NEW
-OUTPUT_FILE = '../3_script_outputs/categorized_journal_entries.csv'
-NEW_MAPPINGS_FILE = '../3_script_outputs/new_mappings_to_review.csv'
-API_KEY = os.environ.get("GOOGLE_API_KEY")
+RULES_BUCKET = os.environ.get("RULES_BUCKET", "accounting-rules-bucket")
 MODEL_ROSTER = ["models/gemini-2.0-flash", "models/gemini-2.5-flash"]
+GCP_PROJECT = "305499564828"
+
+app = FastAPI(title="Accounting Classification API", version="2.0")
+
+
+# --- SECURITY LAYER ---
+
+def _get_secret(secret_id: str) -> str:
+    client = secretmanager.SecretManagerServiceClient()
+    name = f"projects/{GCP_PROJECT}/secrets/{secret_id}/versions/latest"
+    response = client.access_secret_version(request={"name": name})
+    return response.payload.data.decode("UTF-8")
+
+
+async def verify_client(
+    x_api_key: str = Header(...),
+    x_client_id: str = Header(...),
+) -> str:
+    expected_key = _get_secret(f"CLIENT_KEY_{x_client_id}")
+    if x_api_key != expected_key:
+        raise HTTPException(status_code=401, detail="Invalid API key")
+    return x_client_id
+
+
+# --- GCS HELPERS ---
+
+def _stream_csv_from_gcs(bucket_name: str, blob_path: str) -> pd.DataFrame:
+    client = storage.Client()
+    bucket = client.bucket(bucket_name)
+    blob = bucket.blob(blob_path)
+    data = blob.download_as_bytes()
+    return pd.read_csv(io.BytesIO(data))
 
 # --- 1. SETUP ---
 
 
-def load_files():
+def load_rules_from_gcs(client_id: str):
+    prefix = f"{client_id}/"
+
+    rules_dict = {}
     try:
-        rules_df = pd.read_csv(RULES_FILE)
+        rules_df = _stream_csv_from_gcs(RULES_BUCKET, f"{prefix}transaction_rules.csv")
         if not rules_df.empty:
             rules_df = rules_df[~rules_df['Keyword'].astype(str).str.strip().str.startswith('#')]
         rules_dict = dict(zip(rules_df['Keyword'].str.upper(), rules_df['Category']))
     except: rules_dict = {}
-    
+
+    logic_df = pd.DataFrame()
     try:
-        logic_df = pd.read_csv(LOGIC_FILE)
+        logic_df = _stream_csv_from_gcs(RULES_BUCKET, f"{prefix}logic_rules.csv")
         if not logic_df.empty:
             logic_df = logic_df[~logic_df['Rule_Name'].astype(str).str.strip().str.startswith('#')]
     except: logic_df = pd.DataFrame()
 
-    # NEW: Load Correction History
     history_dict = {}
     try:
-        if os.path.exists(HISTORY_FILE):
-            hist_df = pd.read_csv(HISTORY_FILE)
-            # Create a unique key for every corrected transaction
-            for _, row in hist_df.iterrows():
-                # Signature: Date + Signed Amount + Description
-                key = f"{row['Date']}|{float(row['Amount'])}|{str(row['Original_Description']).strip()}"
-                # Save both Category and Memo
-                history_dict[key] = {'Category': row['Category'], 'Memo': row.get('Memo')}
-            print(f"🧠 Loaded {len(history_dict)} past corrections from memory.")
-    except Exception as e:
-        print(f"⚠️ Could not load history: {e}")
-        
-    explode_keywords = set()
-    try:
-        if os.path.exists(NEW_MAPPINGS_FILE):
-            prev_review = pd.read_csv(NEW_MAPPINGS_FILE)
-            if 'Explode? (Y/N)' in prev_review.columns:
-                to_explode = prev_review[prev_review['Explode? (Y/N)'].str.upper() == 'Y']
-                explode_keywords = set(to_explode['Keyword'].str.upper().tolist())
-                if explode_keywords: print(f"💥 Exploding {len(explode_keywords)} keywords.")
+        hist_df = _stream_csv_from_gcs(RULES_BUCKET, f"{prefix}correction_history.csv")
+        for _, row in hist_df.iterrows():
+            key = f"{row['Date']}|{float(row['Amount'])}|{str(row['Original_Description']).strip()}"
+            history_dict[key] = {'Category': row['Category'], 'Memo': row.get('Memo')}
     except: pass
 
     system_toggles = {'INTERCOMPANY_AUTO': False, 'SPLIT_DISTRIBUTION': False}
@@ -65,8 +80,8 @@ def load_files():
         if not ic.empty: system_toggles['INTERCOMPANY_AUTO'] = True
         dist = logic_df[(logic_df['Action'] == 'SPLIT_DISTRIBUTION') & (logic_df['Trigger_Value'] == 'ON')]
         if not dist.empty: system_toggles['SPLIT_DISTRIBUTION'] = True
-        
-    return rules_dict, logic_df, explode_keywords, system_toggles, history_dict
+
+    return rules_dict, logic_df, system_toggles, history_dict
 
 
 def sanitize_description(desc):
@@ -253,55 +268,104 @@ def get_ai_category(client, batch_data, rules_dict):
             continue
     return {}
 
+# --- REVIEW JE GENERATOR (merged from confirm_review_and_update.py) ---
+
+def generate_corrected_je_smart(row_data, category, custom_memo=None):
+    amt = row_data.get('Original_Amount', 0)
+    if amt == 0: amt = row_data.get('JE Amount', 0)
+    abs_amt = abs(amt)
+    payer_entity = row_data['Entity']
+    account = str(row_data.get('Original_Account', ''))
+    desc = row_data.get('Original_Description', '')
+
+    final_memo = desc
+    if custom_memo and str(custom_memo).strip() != '' and str(custom_memo).lower() != 'nan':
+        final_memo = str(custom_memo).strip()
+
+    if pd.isna(category) or category in ("None", ""): category = "Uncategorized"
+
+    target_entity = None
+    clean_category = category
+    match = re.search(r'\[(.*?)\]', category)
+    if match:
+        tag = match.group(1).upper()
+        clean_category = category.replace(f'[{match.group(1)}]', '').strip()
+        if "BB" in tag: target_entity = "ENTITY_B"
+        elif "CC" in tag: target_entity = "ENTITY_C"
+        elif "AA" in tag: target_entity = "ENTITY_A"
+
+    if not target_entity or target_entity == payer_entity:
+        debit, credit = "Uncategorized", "Uncategorized"
+        if amt < 0:
+            credit = "Cash - BB&T"
+            if "Visa" in account: credit = "Credit - BB&T"; debit = clean_category
+            else:
+                if clean_category == "Internal Transfer": debit = "Cash - BB&T"
+                else: debit = clean_category
+        else:
+            debit = "Cash - BB&T"
+            if "Visa" in account: debit = "Credit - BB&T"; credit = clean_category
+            else:
+                if clean_category == "Rental Revenue": credit = "Rental Revenue"
+                else: credit = clean_category
+        return [{"Date": row_data['Date'], "Entity": payer_entity, "JE Amount": abs_amt, "Debit": debit, "Credit": credit, "Memo": final_memo, "Original_Account": row_data.get('Original_Account', ''), "Original_Amount": amt, "Original_Description": desc}]
+
+    if amt < 0:
+        entry1 = {"Date": row_data['Date'], "Entity": payer_entity, "JE Amount": abs_amt, "Debit": f"Short Term Notes - {target_entity}", "Credit": "Cash - BB&T", "Memo": f"Paid on behalf of {target_entity}", "Original_Account": row_data.get('Original_Account', ''), "Original_Amount": amt, "Original_Description": desc}
+        entry2 = {"Date": row_data['Date'], "Entity": target_entity, "JE Amount": abs_amt, "Debit": clean_category, "Credit": f"Short Term Notes - {payer_entity}", "Memo": f"Paid by {payer_entity}", "Original_Account": row_data.get('Original_Account', ''), "Original_Amount": amt, "Original_Description": desc}
+        return [entry1, entry2]
+
+    return generate_corrected_je_smart(row_data, clean_category, custom_memo)
+
+
 # --- MAIN ---
 
-def main():
-    print("--- ENTITY_A: Persistent Memory ---")
-    if not API_KEY: print("❌ No API Key"); return
-    try: df = pd.read_csv(INPUT_FILE)
-    except: print("❌ No Input File"); return
-    
-    df['Category'] = None
-    rules_dict, logic_df, explode_keywords, system_toggles, history_dict = load_files()
-    
+@app.post("/classify")
+async def classify_transactions(
+    file: UploadFile = File(...),
+    client_id: str = Depends(verify_client),
+):
+    # 1. ZERO-PERSISTENCE: Read uploaded CSV into RAM only (SOC 2 Confidentiality)
+    content = await file.read()
+    df = pd.read_csv(io.BytesIO(content))
+
+    # 2. Load rules from GCS
+    rules_dict, logic_df, system_toggles, history_dict = load_rules_from_gcs(client_id)
+
+    # 3. Derive entity from account
     def get_entity(acc):
         if "BB" in str(acc).upper(): return "ENTITY_B"
         if "CC" in str(acc).upper(): return "ENTITY_C"
         return "AA"
     df['Entity'] = df['Account'].apply(get_entity)
+    df['Category'] = None
 
     final_entries = []
     ai_batch = []
-    
-    # 1. Processing
+    review_items = []
+
+    # --- WATERFALL: History -> Special Logic -> Keyword Rules -> AI Fallback ---
     for idx, row in df.iterrows():
         # A. CHECK HISTORY FIRST (The Golden Record)
         hist_key = f"{row['Date']}|{float(row['Amount'])}|{str(row['Description']).strip()}"
-
         if hist_key in history_dict:
-            # Handle Dictionary format (Cat + Memo)
             data = history_dict[hist_key]
-            if isinstance(data, str): # Backward compatibility
-                cat = data
-                memo = None
+            if isinstance(data, str):
+                cat, memo = data, None
             else:
-                cat = data['Category']
-                memo = data.get('Memo')
-
+                cat, memo = data['Category'], data.get('Memo')
             df.at[idx, 'Category'] = cat
-            # Pass the saved memo to the generator
-            entries = generate_je_smart(row, cat, custom_memo=memo)
-            final_entries.extend(entries)
-            continue 
-
+            final_entries.extend(generate_je_smart(row, cat, custom_memo=memo))
+            continue
 
         # B. LOGIC & RULES
         special_cat, special_rows = apply_special_logic(row, logic_df, system_toggles)
         if special_rows: final_entries.extend(special_rows); continue
         if special_cat: df.at[idx, 'Category'] = special_cat; continue
 
+        # C. KEYWORD RULES
         sanitized = sanitize_description(row['Description'])
-        if sanitized and sanitized in rules_dict: 
+        if sanitized and sanitized in rules_dict:
             df.at[idx, 'Category'] = rules_dict[sanitized]
         else:
             found_partial = False
@@ -309,129 +373,85 @@ def main():
                 if key in sanitized: df.at[idx, 'Category'] = rules_dict[key]; found_partial = True; break
             if not found_partial: ai_batch.append({"id": idx, "desc": row['Description']})
 
-
-    # 2. AI
-    new_mappings_details = [] 
-    successful_ai_ids = set() # Track what the AI actually fixes
+    # --- AI FALLBACK ---
+    new_mappings_details = []
+    successful_ai_ids = set()
 
     if ai_batch:
-        print(f"🤖 AI Processing {len(ai_batch)} items...")
-        client = genai.Client(api_key=API_KEY)
+        api_key = _get_secret("GEMINI_API_KEY")
+        client = genai.Client(api_key=api_key)
         chunk_size = 20
         for i in range(0, len(ai_batch), chunk_size):
             chunk = ai_batch[i:i+chunk_size]
             results = get_ai_category(client, chunk, rules_dict)
 
             if results:
-                seen_ids_in_batch = set() # NEW: Prevent double-adding the same ID
-                
+                seen_ids_in_batch = set()
                 for key_id, cat in results.items():
                     try:
                         idx = int(re.sub(r'\D', '', str(key_id)))
-                        
-                        # FAILSAFE: If AI returns same ID twice, ignore the second one
                         if idx in seen_ids_in_batch: continue
                         seen_ids_in_batch.add(idx)
 
                         if idx in df.index:
                             df.at[idx, 'Category'] = cat
-                            successful_ai_ids.add(idx) 
-                            
+                            successful_ai_ids.add(idx)
+
                             clean = sanitize_description(df.at[idx, 'Description'])
                             if not clean: clean = str(df.at[idx, 'Description']).strip()
 
                             if clean and clean not in rules_dict:
                                 new_mappings_details.append({
-                                    'Keyword': clean, 
+                                    'Keyword': clean,
                                     'Category': cat,
                                     'Source_Idx': idx,
                                     'Amount': df.at[idx, 'Amount']
                                 })
                     except: continue
 
-
-        # --- NEW: VISUAL FEEDBACK FOR FAILURES ---
-        failed_count = len(ai_batch) - len(successful_ai_ids)
-        if failed_count > 0:
-            print(f"\n⚠️  AI failed to classify {failed_count} items (Remaining 'Uncategorized'):")
-            print(f"{'Date':<12} | {'Amount':>10} | {'Description'}")
-            print("-" * 80)
-            for item in ai_batch:
-                if item['id'] not in successful_ai_ids:
-                    row = df.loc[item['id']]
-                    print(f"{str(row['Date']):<12} | {row['Amount']:>10.2f} | {str(row['Description'])[:50]}")
-            print("-" * 80)
-            print("   (Tip: Copy these keywords into 'transaction_rules.csv' manually to fix)\n")
-
-
-    # 3. Generate JEs (Using Smart Generator)
-    print("🐍 Generating Journal Entries...")
+    # --- Generate remaining JEs ---
+    ai_ids = {item['id'] for item in ai_batch}
     for idx, row in df.iterrows():
-        if pd.isna(row.get('Category')) and idx not in [item['id'] for item in ai_batch]: continue
+        if pd.isna(row.get('Category')) and idx not in ai_ids: continue
         cat = df.at[idx, 'Category']
         entries = generate_je_smart(row, cat)
         final_entries.extend(entries)
 
-    out_df = pd.DataFrame(final_entries)
-    cols = ['Date', 'Entity', 'JE Amount', 'Debit', 'Credit', 'Memo', 'Original_Account', 'Original_Amount', 'Original_Description']
-    out_df = out_df[cols]
-    out_df.to_csv(OUTPUT_FILE, index=False)
-    
-    # 5. Create Enhanced Review File (RESTORED)
+    # --- Build review_items for front-end feedback loop (merged from confirm_review_and_update.py) ---
     if new_mappings_details:
-        review_df = pd.DataFrame(new_mappings_details)
-        review_df['Sign'] = review_df['Amount'].apply(lambda x: 'Positive' if x >= 0 else 'Negative')
-        review_df['Count'] = review_df.groupby(['Keyword', 'Sign'])['Keyword'].transform('count')
-        
-        exploded_rows = review_df[review_df['Keyword'].str.upper().isin(explode_keywords)]
-        grouped_rows = review_df[~review_df['Keyword'].str.upper().isin(explode_keywords)].drop_duplicates(subset=['Keyword', 'Sign'])
-        final_review_df = pd.concat([exploded_rows, grouped_rows]).sort_values(by=['Keyword'])
-        
-        final_review_rows = []
-
-        for _, item in final_review_df.iterrows():
-            source_row = df.loc[item['Source_Idx']]
-            
-            # OLD BUGGY LINE:
-            # matches = out_df[out_df['Original_Description'] == source_row['Description']]
-            
-            # NEW FIXED LINE: Match Description AND Amount to prevent mix-ups
+        out_df = pd.DataFrame(final_entries)
+        for mapping in new_mappings_details:
+            source_row = df.loc[mapping['Source_Idx']]
             matches = out_df[
-                (out_df['Original_Description'] == source_row['Description']) & 
-                (abs(out_df['Original_Amount'] - source_row['Amount']) < 0.01) # Use tolerance for float
+                (out_df['Original_Description'] == source_row['Description']) &
+                (abs(out_df['Original_Amount'] - source_row['Amount']) < 0.01)
             ]
-            
             if not matches.empty:
                 je_row = matches.iloc[0]
-                # ... rest of the code ...
-                final_review_rows.append({
-                    'Approve/Correct (A/C)': '',
-                    'Correction': '',
-                    'Add Rule? (Y/N)': '', 
-                    'Explode? (Y/N)': 'Y' if item['Keyword'].upper() in explode_keywords else '', 
-                    'Count': item['Count'],
-                    'Keyword': item['Keyword'],
-                    'Category': item['Category'],
-                    'Date': je_row['Date'],
-                    'Entity': je_row['Entity'],
-                    'JE Amount': je_row['JE Amount'],
-                    'Debit': je_row['Debit'],
-                    'Credit': je_row['Credit'],
-                    'Memo': je_row['Memo'],
-                    'Original_Description': je_row['Original_Description'],
-                    'Original_Amount': source_row['Amount']
+                review_items.append({
+                    "needs_review": True,
+                    "keyword": mapping['Keyword'],
+                    "ai_category": mapping['Category'],
+                    "date": je_row['Date'],
+                    "entity": je_row['Entity'],
+                    "je_amount": je_row['JE Amount'],
+                    "debit": je_row['Debit'],
+                    "credit": je_row['Credit'],
+                    "memo": je_row['Memo'],
+                    "original_description": je_row['Original_Description'],
+                    "original_amount": float(source_row['Amount']),
                 })
-        
-        final_review_df = pd.DataFrame(final_review_rows)
-        review_cols = ['Approve/Correct (A/C)', 'Correction', 'Add Rule? (Y/N)', 'Explode? (Y/N)', 'Count', 'Keyword', 'Category', 
-                       'Date', 'Entity', 'JE Amount', 'Debit', 'Credit', 'Memo', 'Original_Description', 'Original_Amount']
-        final_review_df = final_review_df[review_cols]
-        final_review_df.to_csv(NEW_MAPPINGS_FILE, index=False)
-        print(f"⚠️ Created {len(final_review_df)} review items.")
-    else:
-        print("ℹ️ No new rules created.")
 
-    print(f"🚀 DONE! Saved to {OUTPUT_FILE}")
+    return {
+        "status": "success",
+        "security": "Zero-Persistence Active",
+        "engine": "Hybrid-Waterfall-v2",
+        "journal_entries": final_entries,
+        "review_items": review_items,
+    }
+
 
 if __name__ == "__main__":
-    main()
+    import uvicorn
+    port = int(os.environ.get("PORT", 8080))
+    uvicorn.run(app, host="0.0.0.0", port=port)
